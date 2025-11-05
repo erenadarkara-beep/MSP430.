@@ -1,0 +1,112 @@
+#include <msp430.h>
+#include <stdint.h>
+
+extern void ssd1306_init(void);
+extern void ssd1306_clear(void);
+extern void ssd1306_printUI32(uint8_t x, uint8_t y, uint32_t val, uint8_t Hcenter);
+extern void ssd1306_printstr(uint8_t x, uint8_t y, const char *s);
+
+#define SMCLK_FREQ 1048000UL
+#define PWM_FREQ 1000UL
+#define TA1CCR0_VAL (SMCLK_FREQ / PWM_FREQ - 1)
+#define START_DUTY_PC 60U
+#define ADC_MAX 4095U
+
+volatile uint16_t adc_latest = 0;
+
+static inline uint16_t duty_percent_to_ccr1(uint16_t percent)
+{
+    uint32_t top = (uint32_t)TA1CCR0_VAL + 1;
+    if (percent > 100) percent = 100;
+    return (uint16_t)((percent * top) / 100);
+}
+
+void setupTimerA1_PWM(uint16_t initial_duty_percent)
+{
+    TA1CTL = TACLR;
+    P2DIR |= BIT0;
+    P2SEL |= BIT0;
+    TA1CCR0 = TA1CCR0_VAL;
+    TA1CCTL1 = OUTMOD_7;
+    TA1CCR1 = duty_percent_to_ccr1(initial_duty_percent);
+    TA1CTL = TASSEL_2 | MC_1 | TACLR;
+}
+
+void setupTimerA0_for_samplerate(uint32_t samplerate_hz)
+{
+    TA0CTL = TACLR;
+    uint32_t ccr0 = (SMCLK_FREQ / samplerate_hz) - 1;
+    TA0CCR0 = (uint16_t)ccr0;
+    TA0CCTL0 = CCIE;
+    TA0CTL = TASSEL_2 | MC_1 | TACLR;
+}
+
+void setupADC12_singleChannel_A0(void)
+{
+    ADC12CTL0 = ADC12ON | ADC12SHT0_2;
+    ADC12CTL1 = ADC12SHP;
+    ADC12MCTL0 = ADC12INCH_0;
+    ADC12IE = ADC12IE0;
+    ADC12CTL0 |= ADC12ENC;
+}
+
+void oled_update_display(void)
+{
+    uint32_t tar = TA1R;
+    uint32_t ccr1 = TA1CCR1;
+    uint32_t top = (uint32_t)TA1CCR0 + 1;
+    uint32_t duty_pct_times_100 = (ccr1 * 10000UL) / top;
+    ssd1306_clear();
+    ssd1306_printstr(0,0,"TA1R:");
+    ssd1306_printUI32(48,0,tar,0);
+    ssd1306_printstr(0,1,"TA1CCR1:");
+    ssd1306_printUI32(72,1,ccr1,0);
+    ssd1306_printstr(0,2,"Duty x100:");
+    ssd1306_printUI32(80,2,duty_pct_times_100,0);
+}
+
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+    ssd1306_init();
+    ssd1306_clear();
+    setupTimerA1_PWM(START_DUTY_PC);
+    setupADC12_singleChannel_A0();
+    setupTimerA0_for_samplerate(1000);
+    oled_update_display();
+    __enable_interrupt();
+    while (1)
+    {
+        __bis_SR_register(LPM0_bits + GIE);
+        __no_operation();
+    }
+}
+
+#pragma vector = TIMER0_A0_VECTOR
+__interrupt void Timer0_A0_ISR(void)
+{
+    ADC12CTL0 |= ADC12SC;
+    __bic_SR_register_on_exit(LPM0_bits);
+}
+
+#pragma vector = ADC12_VECTOR
+__interrupt void ADC12_ISR(void)
+{
+    switch (__even_in_range(ADC12IV, ADC12IV_ADC12RDY))
+    {
+        case ADC12IV_ADC12IFG0:
+        {
+            uint16_t v = ADC12MEM0;
+            adc_latest = v;
+            uint32_t top = (uint32_t)TA1CCR0 + 1;
+            uint32_t ccr1 = ((uint32_t)v * top) / ADC_MAX;
+            if (ccr1 == 0) ccr1 = 1;
+            if (ccr1 >= top) ccr1 = top - 1;
+            TA1CCR1 = (uint16_t)ccr1;
+            oled_update_display();
+            __bic_SR_register_on_exit(LPM0_bits);
+            break;
+        }
+        default: break;
+    }
+}
